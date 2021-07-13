@@ -2,8 +2,10 @@ use super::Parse;
 use std::collections::HashMap;
 use twiggy_ir::{self as ir, Id};
 use twiggy_traits as traits;
-use wasmparser::SectionWithLimitedItems;
-use wasmparser::{self, Operator, SectionReader, Type};
+use wasmparser::{
+    self, Chunk, TypeDef, Operator, Parser, Payload, SectionReader, SectionWithLimitedItems,
+    Type,
+};
 
 #[derive(Default)]
 pub struct SectionIndices {
@@ -15,304 +17,292 @@ pub struct SectionIndices {
     globals: Vec<Id>,
 }
 
-struct IndexedSection<'a>(usize, wasmparser::Section<'a>);
-
-impl<'a> Parse<'a> for wasmparser::ModuleReader<'a> {
-    type ItemsExtra = ();
-
-    fn parse_items(
-        &mut self,
-        items: &mut ir::ItemsBuilder,
-        _extra: (),
-    ) -> Result<(), traits::Error> {
-        let initial_offset = self.current_position();
-        let mut sections: Vec<IndexedSection<'_>> = Vec::new();
-        let mut code_section: Option<IndexedSection<'_>> = None;
-        let mut function_section: Option<IndexedSection<'_>> = None;
-        let mut sizes: HashMap<usize, u32> = HashMap::new();
-
-        // The function and code sections must be handled differently, so these
-        // are not placed in the same `sections` array as the rest.
-        let mut idx = 0;
-        while !self.eof() {
-            let start = self.current_position();
-            let section = self.read()?;
-            let size = self.current_position() - start;
-            let indexed_section = IndexedSection(idx, section);
-            match indexed_section.1.code {
-                wasmparser::SectionCode::Code => code_section = Some(indexed_section),
-                wasmparser::SectionCode::Function => function_section = Some(indexed_section),
-                _ => sections.push(indexed_section),
-            };
-            sizes.insert(idx, size as u32);
-            idx += 1;
-        }
-
-        let sections_cnt = sections.len()
-            + if code_section.is_some() { 1 } else { 0 }
-            + if function_section.is_some() { 1 } else { 0 };
-        let id = Id::section(sections_cnt);
-        items.add_root(ir::Item::new(
-            id,
-            "wasm magic bytes".to_string(),
-            initial_offset as u32,
-            ir::Misc::new(),
-        ));
-
-        // Before we actually parse any items prepare to parse a few sections
-        // below, namely the code section. When parsing the code section we want
-        // to try to assign human-readable names so we need the name section, if
-        // present. Additionally we need to look at the number of imported
-        // functions to handle the wasm function index space correctly.
-        let names = parse_names_section(&sections)?;
-        let imported_functions = count_imported_functions(&sections)?;
-
-        // Next, we parse the function and code sections together, so that we
-        // can collapse corresponding entries from the code and function
-        // sections into a single representative IR item.
-        match (function_section, code_section) {
-            (Some(function_section), Some(code_section)) => (function_section, code_section)
-                .parse_items(items, (imported_functions, &names, &sizes))?,
-            _ => Err(traits::Error::with_msg(
-                "function or code section is missing",
-            ))?,
-        };
-
-        for IndexedSection(idx, section) in sections.into_iter() {
-            let start = items.size_added();
-            let name = get_section_name(&section);
-            match section.code {
-                wasmparser::SectionCode::Custom { name, .. } => {
-                    CustomSectionReader(name, section).parse_items(items, idx)?;
-                }
-                wasmparser::SectionCode::Type => {
-                    section.get_type_section_reader()?.parse_items(items, idx)?;
-                }
-                wasmparser::SectionCode::Import => {
-                    section
-                        .get_import_section_reader()?
-                        .parse_items(items, idx)?;
-                }
-                wasmparser::SectionCode::Table => {
-                    section
-                        .get_table_section_reader()?
-                        .parse_items(items, idx)?;
-                }
-                wasmparser::SectionCode::Memory => {
-                    section
-                        .get_memory_section_reader()?
-                        .parse_items(items, idx)?;
-                }
-                wasmparser::SectionCode::Global => {
-                    section
-                        .get_global_section_reader()?
-                        .parse_items(items, idx)?;
-                }
-                wasmparser::SectionCode::Export => {
-                    section
-                        .get_export_section_reader()?
-                        .parse_items(items, idx)?;
-                }
-                wasmparser::SectionCode::Start => {
-                    StartSection(section).parse_items(items, idx)?;
-                }
-                wasmparser::SectionCode::Element => {
-                    section
-                        .get_element_section_reader()?
-                        .parse_items(items, idx)?;
-                }
-                wasmparser::SectionCode::Data => {
-                    section.get_data_section_reader()?.parse_items(items, idx)?;
-                }
-                wasmparser::SectionCode::DataCount => {
-                    DataCountSection(section).parse_items(items, idx)?;
-                }
-                wasmparser::SectionCode::Code | wasmparser::SectionCode::Function => {
-                    unreachable!("unexpected code or function section found");
-                }
-            };
-            let id = Id::section(idx);
-            let added = items.size_added() - start;
-            let size = sizes
-                .get(&idx)
-                .ok_or_else(|| traits::Error::with_msg("Could not find section size"))?;
-            assert!(added <= *size);
-            items.add_root(ir::Item::new(id, name, size - added, ir::Misc::new()));
-        }
-
-        Ok(())
-    }
-
-    type EdgesExtra = ();
-
-    fn parse_edges(
-        &mut self,
-        items: &mut ir::ItemsBuilder,
-        _extra: (),
-    ) -> Result<(), traits::Error> {
-        let mut sections: Vec<IndexedSection<'_>> = Vec::new();
-        let mut code_section: Option<IndexedSection<'a>> = None;
-        let mut function_section: Option<IndexedSection<'a>> = None;
-
-        let mut idx = 0;
-        while !self.eof() {
-            let section = self.read()?;
-            match section.code {
-                wasmparser::SectionCode::Code => code_section = Some(IndexedSection(idx, section)),
-                wasmparser::SectionCode::Function => {
-                    function_section = Some(IndexedSection(idx, section))
-                }
-                _ => sections.push(IndexedSection(idx, section)),
-            };
-            idx += 1;
-        }
-
-        // Like above we do some preprocessing here before actually drawing all
-        // the edges below. Here we primarily want to learn some properties of
-        // the wasm module, such as what `Id` is mapped to all index spaces in
-        // the wasm module. To handle that we build up all this data in
-        // `SectionIndices` here as we parse all the various sections.
-        let mut indices = SectionIndices::default();
-        for IndexedSection(idx, section) in sections.iter() {
-            match section.code {
-                wasmparser::SectionCode::Type => {
-                    indices.type_ = Some(*idx);
-                }
-                wasmparser::SectionCode::Import => {
-                    let reader = section.get_import_section_reader()?;
-                    for (i, import) in reader.into_iter().enumerate() {
-                        let id = Id::entry(*idx, i);
-                        match import?.ty {
-                            wasmparser::ImportSectionEntryType::Function(_) => {
-                                indices.functions.push(id);
-                            }
-                            wasmparser::ImportSectionEntryType::Table(_) => {
-                                indices.tables.push(id);
-                            }
-                            wasmparser::ImportSectionEntryType::Memory(_) => {
-                                indices.memories.push(id);
-                            }
-                            wasmparser::ImportSectionEntryType::Global(_) => {
-                                indices.globals.push(id);
-                            }
-                        }
-                    }
-                }
-                wasmparser::SectionCode::Global => {
-                    for i in 0..section.get_global_section_reader()?.get_count() {
-                        let id = Id::entry(*idx, i as usize);
-                        indices.globals.push(id);
-                    }
-                }
-                wasmparser::SectionCode::Memory => {
-                    for i in 0..section.get_memory_section_reader()?.get_count() {
-                        let id = Id::entry(*idx, i as usize);
-                        indices.memories.push(id);
-                    }
-                }
-                wasmparser::SectionCode::Table => {
-                    for i in 0..section.get_table_section_reader()?.get_count() {
-                        let id = Id::entry(*idx, i as usize);
-                        indices.tables.push(id);
-                    }
-                }
-                wasmparser::SectionCode::Code => {
-                    Err(traits::Error::with_msg("unexpected code section"))?
-                }
-                wasmparser::SectionCode::Function => {
-                    Err(traits::Error::with_msg("unexpected function section"))?
-                }
-                _ => {}
-            }
-        }
-        if let (Some(IndexedSection(_, function_section)), Some(IndexedSection(code_idx, _))) =
-            (function_section.as_ref(), code_section.as_ref())
-        {
-            indices.code = Some(*code_idx);
-            for i in 0..function_section.get_function_section_reader()?.get_count() {
-                let id = Id::entry(*code_idx, i as usize);
-                indices.functions.push(id);
-            }
-        }
-
-        match (function_section, code_section) {
-            (Some(function_section), Some(code_section)) => {
-                (function_section, code_section).parse_edges(items, &indices)?
-            }
-            _ => panic!("function or code section is missing"),
-        };
-        for IndexedSection(idx, section) in sections.into_iter() {
-            match section.code {
-                wasmparser::SectionCode::Custom { name, .. } => {
-                    CustomSectionReader(name, section).parse_edges(items, ())?;
-                }
-                wasmparser::SectionCode::Type => {
-                    section.get_type_section_reader()?.parse_edges(items, ())?;
-                }
-                wasmparser::SectionCode::Import => {
-                    section
-                        .get_import_section_reader()?
-                        .parse_edges(items, ())?;
-                }
-                wasmparser::SectionCode::Table => {
-                    section.get_table_section_reader()?.parse_edges(items, ())?;
-                }
-                wasmparser::SectionCode::Memory => {
-                    section
-                        .get_memory_section_reader()?
-                        .parse_edges(items, ())?;
-                }
-                wasmparser::SectionCode::Global => {
-                    section
-                        .get_global_section_reader()?
-                        .parse_edges(items, ())?;
-                }
-                wasmparser::SectionCode::Export => {
-                    section
-                        .get_export_section_reader()?
-                        .parse_edges(items, (&indices, idx))?;
-                }
-                wasmparser::SectionCode::Start => {
-                    StartSection(section).parse_edges(items, (&indices, idx))?;
-                }
-                wasmparser::SectionCode::Element => {
-                    section
-                        .get_element_section_reader()?
-                        .parse_edges(items, (&indices, idx))?;
-                }
-                wasmparser::SectionCode::Data => {
-                    section.get_data_section_reader()?.parse_edges(items, ())?;
-                }
-                wasmparser::SectionCode::DataCount => {
-                    DataCountSection(section).parse_edges(items, ())?;
-                }
-                wasmparser::SectionCode::Code | wasmparser::SectionCode::Function => {
-                    unreachable!("unexpected code or function section found");
-                }
-            }
-        }
-
-        Ok(())
-    }
+#[derive(Default)]
+struct ParseResult<'a> {
+    sections: Vec<IndexedSection<'a>>,
+    code_section: Option<CodeSection<'a>>,
+    function_section: Option<FuncSection<'a>>,
+    sizes: HashMap<usize, u32>,
 }
 
-fn get_section_name(section: &wasmparser::Section<'_>) -> String {
-    match section.code {
-        wasmparser::SectionCode::Custom { name, .. } => {
+struct IndexedSection<'a>(usize, wasmparser::Payload<'a>);
+struct FuncSection<'a>(usize, wasmparser::FunctionSectionReader<'a>);
+struct CodeSection<'a>(usize, Vec<(u32, wasmparser::FunctionBody<'a>)>);
+struct CustomSectionReader<'a>(&'a str, &'a [u8]);
+struct WrappedDataCountSection(wasmparser::Range);
+struct WrappedStartSection(wasmparser::Range);
+
+pub fn parse_items(items: &mut ir::ItemsBuilder, data: &[u8]) -> Result<(), traits::Error> {
+    let module = parse_module(data)?;
+
+    let sections_cnt = module.sections.len()
+        + if module.code_section.is_some() { 1 } else { 0 }
+        + if module.function_section.is_some() {
+            1
+        } else {
+            0
+        };
+    let id = Id::section(sections_cnt);
+    items.add_root(ir::Item::new(
+        id,
+        "wasm magic bytes".to_string(),
+        0,
+        ir::Misc::new(),
+    ));
+
+    // Before we actually parse any items prepare to parse a few sections
+    // below, namely the code section. When parsing the code section we want
+    // to try to assign human-readable names so we need the name section, if
+    // present. Additionally we need to look at the number of imported
+    // functions to handle the wasm function index space correctly.
+    let names = parse_names_section(&module.sections)?;
+    let imported_functions = count_imported_functions(&module.sections)?;
+
+    // Next, we parse the function and code sections together, so that we
+    // can collapse corresponding entries from the code and function
+    // sections into a single representative IR item.
+    match (module.function_section, module.code_section) {
+        (Some(function_section), Some(code_section)) => (function_section, code_section)
+            .parse_items(items, (imported_functions, &names, &module.sizes))?,
+        _ => Err(traits::Error::with_msg(
+            "function or code section is missing",
+        ))?,
+    };
+
+    for IndexedSection(idx, section) in module.sections.into_iter() {
+        let start = items.size_added();
+        let name = get_section_name(&section);
+        use Payload::*;
+        match section {
+            CustomSection { name, data, .. } => CustomSectionReader(name, data)
+                .parse_items(items, (idx, *module.sizes.get(&idx).unwrap()))?,
+            TypeSection(mut reader) => reader.parse_items(items, idx)?,
+            ImportSection(mut reader) => reader.parse_items(items, idx)?,
+            TableSection(mut reader) => reader.parse_items(items, idx)?,
+            MemorySection(mut reader) => reader.parse_items(items, idx)?,
+            GlobalSection(mut reader) => reader.parse_items(items, idx)?,
+            ExportSection(mut reader) => reader.parse_items(items, idx)?,
+            StartSection { range, .. } => WrappedStartSection(range).parse_items(items, idx)?,
+            ElementSection(mut section) => section.parse_items(items, idx)?,
+            DataSection(mut reader) => reader.parse_items(items, idx)?,
+            DataCountSection { range, .. } => {
+                WrappedDataCountSection(range).parse_items(items, idx)?
+            }
+            CodeSectionStart { .. } | CodeSectionEntry(_) | FunctionSection(_) => {
+                unreachable!("unexpected code or function section found")
+            }
+            _ => (),
+        };
+        let id = Id::section(idx);
+        let added = items.size_added() - start;
+        let size = module
+            .sizes
+            .get(&idx)
+            .ok_or_else(|| traits::Error::with_msg("Could not find section size"))?;
+        assert!(added <= *size);
+        items.add_root(ir::Item::new(id, name, size - added, ir::Misc::new()));
+    }
+
+    Ok(())
+}
+
+pub fn parse_edges(items: &mut ir::ItemsBuilder, data: &[u8]) -> Result<(), traits::Error> {
+    let module = parse_module(data)?;
+
+    // Like above we do some preprocessing here before actually drawing all
+    // the edges below. Here we primarily want to learn some properties of
+    // the wasm module, such as what `Id` is mapped to all index spaces in
+    // the wasm module. To handle that we build up all this data in
+    // `SectionIndices` here as we parse all the various sections.
+    let mut indices = SectionIndices::default();
+    for IndexedSection(idx, section) in module.sections.iter() {
+        use Payload::*;
+        match section {
+            TypeSection(_) => {
+                indices.type_ = Some(*idx);
+            }
+            ImportSection(reader) => {
+                for (i, import) in reader.clone().into_iter().enumerate() {
+                    let id = Id::entry(*idx, i);
+                    match import?.ty {
+                        wasmparser::ImportSectionEntryType::Function(_) => {
+                            indices.functions.push(id)
+                        }
+                        wasmparser::ImportSectionEntryType::Table(_) => indices.tables.push(id),
+                        wasmparser::ImportSectionEntryType::Memory(_) => indices.memories.push(id),
+                        wasmparser::ImportSectionEntryType::Global(_) => indices.globals.push(id),
+                        _ => (),
+                    }
+                }
+            }
+            GlobalSection(reader) => {
+                for i in 0..reader.get_count() {
+                    let id = Id::entry(*idx, i as usize);
+                    indices.globals.push(id);
+                }
+            }
+            MemorySection(reader) => {
+                for i in 0..reader.get_count() {
+                    let id = Id::entry(*idx, i as usize);
+                    indices.memories.push(id);
+                }
+            }
+            TableSection(reader) => {
+                for i in 0..reader.get_count() {
+                    let id = Id::entry(*idx, i as usize);
+                    indices.tables.push(id);
+                }
+            }
+            CodeSectionStart { .. } | CodeSectionEntry(_) | FunctionSection(_) => {
+                unreachable!("unexpected code or function section found");
+            }
+            _ => (),
+        }
+    }
+    if let (Some(FuncSection(_, function_section)), Some(CodeSection(code_idx, _))) = (
+        module.function_section.as_ref(),
+        module.code_section.as_ref(),
+    ) {
+        indices.code = Some(*code_idx);
+        for i in 0..function_section.get_count() {
+            let id = Id::entry(*code_idx, i as usize);
+            indices.functions.push(id);
+        }
+    }
+
+    match (module.function_section, module.code_section) {
+        (Some(function_section), Some(code_section)) => {
+            (function_section, code_section).parse_edges(items, &indices)?
+        }
+        _ => panic!("function or code section is missing"),
+    };
+    for IndexedSection(idx, section) in module.sections {
+        use Payload::*;
+        match section {
+            CustomSection { name, .. } => {
+                CustomSectionReader(name, data).parse_edges(items, ())?;
+            }
+            TypeSection(mut reader) => reader.parse_edges(items, ())?,
+            ImportSection(mut reader) => reader.parse_edges(items, ())?,
+            TableSection(mut reader) => reader.parse_edges(items, ())?,
+            MemorySection(mut reader) => reader.parse_edges(items, ())?,
+            GlobalSection(mut reader) => reader.parse_edges(items, ())?,
+            ExportSection(mut reader) => reader.parse_edges(items, (&indices, idx))?,
+            StartSection { range, func, .. } => {
+                WrappedStartSection(range).parse_edges(items, (&indices, idx, func))?
+            }
+            ElementSection(mut reader) => reader.parse_edges(items, (&indices, idx))?,
+            DataSection(mut reader) => reader.parse_edges(items, ())?,
+            DataCountSection { range, .. } => {
+                WrappedDataCountSection(range).parse_edges(items, ())?
+            }
+            CodeSectionStart { .. } | CodeSectionEntry(_) | FunctionSection(_) => {
+                unreachable!("unexpected code or function section found")
+            }
+            _ => (),
+        }
+    }
+
+    Ok(())
+}
+
+fn read_module<'a, F>(mut data: &'a [u8], mut callback: F) -> Result<(), traits::Error>
+where
+    F: FnMut(usize, Payload<'a>) -> Result<(), traits::Error>,
+{
+    let mut parser = Parser::new(0);
+    let mut stack = Vec::new();
+
+    loop {
+        let (payload, consumed) = match parser.parse(data, true)? {
+            Chunk::NeedMoreData(_) => unreachable!("we set `eof` to true."),
+            Chunk::Parsed { consumed, payload } => (payload, consumed),
+        };
+
+        use Payload::*;
+        match payload {
+            // When parsing nested modules we need to switch which
+            // `Parser` we're using.
+            ModuleSectionStart { .. } => {}
+            ModuleSectionEntry {
+                parser: subparser, ..
+            } => {
+                stack.push(parser);
+                parser = subparser;
+            }
+
+            // Once we've reached the end of a module we either resume
+            // at the parent module or we break out of the loop because
+            // we're done.
+            End => {
+                if let Some(parent_parser) = stack.pop() {
+                    parser = parent_parser;
+                } else {
+                    break;
+                }
+            }
+
+            // All other sections are forwarded to the caller.
+            section => callback(consumed, section)?,
+        }
+
+        data = &data[consumed..];
+    }
+
+    Ok(())
+}
+
+fn parse_module(data: &[u8]) -> Result<ParseResult, traits::Error> {
+    let mut result = ParseResult::default();
+    let mut idx = 0;
+
+    // The function and code sections must be handled differently, so these
+    // are not placed in the same `sections` array as the rest.
+    read_module(data, |size, section| {
+        result.sizes.insert(idx, size as u32);
+        match section {
+            wasmparser::Payload::FunctionSection(reader) => {
+                result.function_section = Some(FuncSection(idx, reader));
+                idx += 1;
+            }
+            wasmparser::Payload::CodeSectionStart { count, .. } => {
+                result.code_section = Some(CodeSection(idx, Vec::with_capacity(count as usize)));
+                idx += 1;
+            }
+            wasmparser::Payload::CodeSectionEntry(body) => {
+                result.code_section.as_mut().unwrap().1.push((size as u32, body))
+                // no index increment as code section entries are not top level
+            }
+            _ => {
+                result.sections.push(IndexedSection(idx, section));
+                idx += 1;
+            }
+        };
+        Ok(())
+    })?;
+
+    Ok(result)
+}
+
+fn get_section_name(section: &wasmparser::Payload<'_>) -> String {
+    use Payload::*;
+    match section {
+        CustomSection { name, .. } => {
             format!("custom section '{}' headers", name)
         }
-        wasmparser::SectionCode::Type => "type section headers".to_string(),
-        wasmparser::SectionCode::Import => "import section headers".to_string(),
-        wasmparser::SectionCode::Function => "function section headers".to_string(),
-        wasmparser::SectionCode::Table => "table section headers".to_string(),
-        wasmparser::SectionCode::Memory => "memory section headers".to_string(),
-        wasmparser::SectionCode::Global => "global section headers".to_string(),
-        wasmparser::SectionCode::Export => "export section headers".to_string(),
-        wasmparser::SectionCode::Start => "start section headers".to_string(),
-        wasmparser::SectionCode::Element => "element section headers".to_string(),
-        wasmparser::SectionCode::Code => "code section headers".to_string(),
-        wasmparser::SectionCode::Data => "data section headers".to_string(),
-        wasmparser::SectionCode::DataCount => "data count section headers".to_string(),
+        TypeSection(_) => "type section headers".to_string(),
+        ImportSection(_) => "import section headers".to_string(),
+        FunctionSection(_) => "function section headers".to_string(),
+        TableSection(_) => "table section headers".to_string(),
+        MemorySection(_) => "memory section headers".to_string(),
+        GlobalSection(_) => "global section headers".to_string(),
+        ExportSection(_) => "export section headers".to_string(),
+        StartSection { .. } => "start section headers".to_string(),
+        ElementSection(_) => "element section headers".to_string(),
+        CodeSectionStart { .. } => "code section headers".to_string(),
+        DataSection(_) => "data section headers".to_string(),
+        DataCountSection { .. } => "data count section headers".to_string(),
+        _ => "unknown section".to_string(),
     }
 }
 
@@ -321,8 +311,11 @@ fn parse_names_section<'a>(
 ) -> Result<HashMap<usize, &'a str>, traits::Error> {
     let mut names = HashMap::new();
     for IndexedSection(_, section) in indexed_sections.iter() {
-        if let wasmparser::SectionCode::Custom { name: "name", .. } = section.code {
-            for subsection in section.get_name_section_reader()? {
+        if let Payload::CustomSection {
+            name: "name", data, ..
+        } = section
+        {
+            for subsection in wasmparser::NameSectionReader::new(data, 0)? {
                 let f = match subsection? {
                     wasmparser::Name::Function(f) => f,
                     _ => continue,
@@ -343,8 +336,8 @@ fn count_imported_functions<'a>(
 ) -> Result<usize, traits::Error> {
     let mut imported_functions = 0;
     for IndexedSection(_, section) in indexed_sections.iter() {
-        if let wasmparser::SectionCode::Import = section.code {
-            for import in section.get_import_section_reader()? {
+        if let Payload::ImportSection(reader) = section {
+            for import in reader.clone() {
                 if let wasmparser::ImportSectionEntryType::Function(_) = import?.ty {
                     imported_functions += 1;
                 }
@@ -354,7 +347,35 @@ fn count_imported_functions<'a>(
     Ok(imported_functions)
 }
 
-impl<'a> Parse<'a> for (IndexedSection<'a>, IndexedSection<'a>) {
+fn iterate_with_size<'a, S: SectionWithLimitedItems + SectionReader>(
+    s: &'a mut S,
+) -> impl Iterator<Item = Result<(S::Item, u32), traits::Error>> + 'a {
+    let count = s.get_count();
+    (0..count).map(move |i| {
+        let start = s.original_position();
+        let item = s.read()?;
+        let size = (s.original_position() - start) as u32;
+        if i == count - 1 {
+            s.ensure_end()?;
+        }
+        Ok((item, size))
+    })
+}
+
+fn ty2str(t: Type) -> &'static str {
+    match t {
+        Type::I32 => "i32",
+        Type::I64 => "i64",
+        Type::F32 => "f32",
+        Type::F64 => "f64",
+        Type::V128 => "v128",
+        Type::FuncRef => "funcref",
+        Type::ExnRef | Type::ExternRef => "extref",
+        Type::Func | Type::EmptyBlockType => "?",
+    }
+}
+
+impl<'a> Parse<'a> for (FuncSection<'a>, CodeSection<'a>) {
     type ItemsExtra = (usize, &'a HashMap<usize, &'a str>, &'a HashMap<usize, u32>);
 
     fn parse_items(
@@ -362,15 +383,10 @@ impl<'a> Parse<'a> for (IndexedSection<'a>, IndexedSection<'a>) {
         items: &mut ir::ItemsBuilder,
         (imported_functions, names, sizes): Self::ItemsExtra,
     ) -> Result<(), traits::Error> {
-        let (
-            IndexedSection(func_section_idx, func_section),
-            IndexedSection(code_section_idx, code_section),
-        ) = self;
+        let (FuncSection(func_section_idx, func_reader), CodeSection(code_section_idx, bodies)) =
+            self;
 
-        let mut func_reader = func_section.get_function_section_reader()?;
-        let mut code_reader = code_section.get_code_section_reader()?;
-
-        let func_items: Vec<ir::Item> = iterate_with_size(&mut func_reader)
+        let func_items: Vec<ir::Item> = iterate_with_size(func_reader)
             .enumerate()
             .map(|(i, func)| {
                 let (_func, size) = func?;
@@ -381,11 +397,12 @@ impl<'a> Parse<'a> for (IndexedSection<'a>, IndexedSection<'a>) {
             })
             .collect::<Result<_, traits::Error>>()?;
 
-        let code_items: Vec<ir::Item> = iterate_with_size(&mut code_reader)
+        let code_items: Vec<ir::Item> = bodies
+            .iter()
             .zip(func_items.into_iter())
             .enumerate()
             .map(|(i, (body, func))| {
-                let (_body, size) = body?;
+                let (size, _) = body;
                 let id = Id::entry(*code_section_idx, i);
                 let name = names
                     .get(&(i + imported_functions))
@@ -397,7 +414,7 @@ impl<'a> Parse<'a> for (IndexedSection<'a>, IndexedSection<'a>) {
             .collect::<Result<_, traits::Error>>()?;
 
         let start = items.size_added();
-        let name = get_section_name(code_section);
+        let name = "code section headers".to_string();
         for item in code_items.into_iter() {
             items.add_item(item);
         }
@@ -422,18 +439,14 @@ impl<'a> Parse<'a> for (IndexedSection<'a>, IndexedSection<'a>) {
         items: &mut ir::ItemsBuilder,
         indices: Self::EdgesExtra,
     ) -> Result<(), traits::Error> {
-        let (IndexedSection(_, function_section), IndexedSection(code_section_idx, code_section)) =
-            self;
-
-        let mut func_reader = function_section.get_function_section_reader()?;
-        let mut code_reader = code_section.get_code_section_reader()?;
+        let (FuncSection(_, func_reader), CodeSection(code_section_idx, bodies)) = self;
 
         type Edge = (ir::Id, ir::Id);
 
         let mut edges: Vec<Edge> = Vec::new();
 
         // Function section reader parsing.
-        for (func_i, type_ref) in iterate_with_size(&mut func_reader).enumerate() {
+        for (func_i, type_ref) in iterate_with_size(func_reader).enumerate() {
             let (type_ref, _) = type_ref?;
             if let Some(type_idx) = indices.type_ {
                 let type_id = Id::entry(type_idx, type_ref as usize);
@@ -445,8 +458,8 @@ impl<'a> Parse<'a> for (IndexedSection<'a>, IndexedSection<'a>) {
         }
 
         // Code section reader parsing.
-        for (b_i, body) in iterate_with_size(&mut code_reader).enumerate() {
-            let (body, _size) = body?;
+        for (b_i, body) in bodies.iter().enumerate() {
+            let (_, body) = body;
             let body_id = Id::entry(*code_section_idx, b_i);
 
             let mut cache = None;
@@ -463,7 +476,7 @@ impl<'a> Parse<'a> for (IndexedSection<'a>, IndexedSection<'a>) {
                     // indices get pushed onto the stack.
                     Operator::CallIndirect { .. } => continue,
 
-                    Operator::GetGlobal { global_index } | Operator::SetGlobal { global_index } => {
+                    Operator::GlobalGet { global_index } | Operator::GlobalSet { global_index } => {
                         let g_id = indices.globals[global_index as usize];
                         edges.push((body_id, g_id));
                     }
@@ -518,6 +531,7 @@ impl<'a> Parse<'a> for wasmparser::NameSectionReader<'a> {
                 wasmparser::Name::Module(_) => "\"module name\" subsection",
                 wasmparser::Name::Function(_) => "\"function names\" subsection",
                 wasmparser::Name::Local(_) => "\"local names\" subsection",
+                _ => continue,
             };
             let id = Id::entry(idx, i);
             items.add_root(ir::Item::new(id, name, size, ir::DebugInfo::new()));
@@ -534,22 +548,18 @@ impl<'a> Parse<'a> for wasmparser::NameSectionReader<'a> {
     }
 }
 
-struct CustomSectionReader<'a>(&'a str, wasmparser::Section<'a>);
-
 impl<'a> Parse<'a> for CustomSectionReader<'a> {
-    type ItemsExtra = usize;
+    type ItemsExtra = (usize, u32);
 
     fn parse_items(
         &mut self,
         items: &mut ir::ItemsBuilder,
-        idx: usize,
+        (idx, size): (usize, u32),
     ) -> Result<(), traits::Error> {
         let name = self.0;
         if name == "name" {
-            self.1.get_name_section_reader()?.parse_items(items, idx)?;
+            wasmparser::NameSectionReader::new(self.1, 0)?.parse_items(items, idx)?;
         } else {
-            let range = self.1.get_binary_reader().range();
-            let size = (range.end - range.start) as u32;
             let id = Id::entry(idx, 0);
             let name = format!("custom section '{}'", self.0);
             items.add_item(ir::Item::new(id, name, size, ir::Misc::new()));
@@ -574,6 +584,11 @@ impl<'a> Parse<'a> for wasmparser::TypeSectionReader<'a> {
     ) -> Result<(), traits::Error> {
         for (i, ty) in iterate_with_size(self).enumerate() {
             let (ty, size) = ty?;
+            let ty = if let TypeDef::Func(ty) = ty {
+                ty
+            } else {
+                continue
+            };
             let id = Id::entry(idx, i);
 
             let mut name = format!("type[{}]: (", i);
@@ -623,7 +638,7 @@ impl<'a> Parse<'a> for wasmparser::ImportSectionReader<'a> {
         for (i, imp) in iterate_with_size(self).enumerate() {
             let (imp, size) = imp?;
             let id = Id::entry(idx, i);
-            let name = format!("import {}::{}", imp.module, imp.field);
+            let name = format!("import {}::{}", imp.module, imp.field.unwrap_or("()"));
             items.add_item(ir::Item::new(id, name, size, ir::Misc::new()));
         }
         Ok(())
@@ -748,7 +763,8 @@ impl<'a> Parse<'a> for wasmparser::ExportSectionReader<'a> {
                 }
                 wasmparser::ExternalKind::Global => {
                     items.add_edge(exp_id, indices.globals[exp.index as usize]);
-                }
+                },
+                _ => (),
             }
         }
 
@@ -756,9 +772,7 @@ impl<'a> Parse<'a> for wasmparser::ExportSectionReader<'a> {
     }
 }
 
-struct StartSection<'a>(wasmparser::Section<'a>);
-
-impl<'a> Parse<'a> for StartSection<'a> {
+impl<'a> Parse<'a> for WrappedStartSection {
     type ItemsExtra = usize;
 
     fn parse_items(
@@ -766,30 +780,26 @@ impl<'a> Parse<'a> for StartSection<'a> {
         items: &mut ir::ItemsBuilder,
         idx: usize,
     ) -> Result<(), traits::Error> {
-        let range = self.0.range();
-        let size = (range.end - range.start) as u32;
+        let size = (self.0.end - self.0.start) as u32;
         let id = Id::section(idx);
         let name = "\"start\" section";
         items.add_root(ir::Item::new(id, name, size, ir::Misc::new()));
         Ok(())
     }
 
-    type EdgesExtra = (&'a SectionIndices, usize);
+    type EdgesExtra = (&'a SectionIndices, usize, u32);
 
     fn parse_edges(
         &mut self,
         items: &mut ir::ItemsBuilder,
-        (indices, idx): Self::EdgesExtra,
+        (indices, idx, func_index): Self::EdgesExtra,
     ) -> Result<(), traits::Error> {
-        let f_i = self.0.get_start_section_content()?;
-        items.add_edge(Id::section(idx), indices.functions[f_i as usize]);
+        items.add_edge(Id::section(idx), indices.functions[func_index as usize]);
         Ok(())
     }
 }
 
-struct DataCountSection<'a>(wasmparser::Section<'a>);
-
-impl<'a> Parse<'a> for DataCountSection<'a> {
+impl<'a> Parse<'a> for WrappedDataCountSection {
     type ItemsExtra = usize;
 
     fn parse_items(
@@ -797,8 +807,7 @@ impl<'a> Parse<'a> for DataCountSection<'a> {
         items: &mut ir::ItemsBuilder,
         idx: usize,
     ) -> Result<(), traits::Error> {
-        let range = self.0.range();
-        let size = (range.end - range.start) as u32;
+        let size = (self.0.end - self.0.start) as u32;
         let id = Id::section(idx);
         let name = "\"data count\" section";
         items.add_root(ir::Item::new(id, name, size, ir::Misc::new()));
@@ -844,11 +853,13 @@ impl<'a> Parse<'a> for wasmparser::ElementSectionReader<'a> {
                 wasmparser::ElementKind::Active { table_index, .. } => {
                     items.add_edge(indices.tables[table_index as usize], elem_id);
                 }
-                wasmparser::ElementKind::Passive(_ty) => {}
+                wasmparser::ElementKind::Passive | wasmparser::ElementKind::Declared => {}
             }
             for func_idx in elem.items.get_items_reader()? {
                 let func_idx = func_idx?;
-                items.add_edge(elem_id, indices.functions[func_idx as usize]);
+                if let wasmparser::ElementItem::Func(func_idx) = func_idx {
+                    items.add_edge(elem_id, indices.functions[func_idx as usize]);
+                }
             }
         }
 
@@ -893,33 +904,5 @@ impl<'a> Parse<'a> for wasmparser::DataSectionReader<'a> {
 
     fn parse_edges(&mut self, _: &mut ir::ItemsBuilder, _: ()) -> Result<(), traits::Error> {
         Ok(())
-    }
-}
-
-fn iterate_with_size<'a, S: SectionWithLimitedItems + SectionReader>(
-    s: &'a mut S,
-) -> impl Iterator<Item = Result<(S::Item, u32), traits::Error>> + 'a {
-    let count = s.get_count();
-    (0..count).map(move |i| {
-        let start = s.original_position();
-        let item = s.read()?;
-        let size = (s.original_position() - start) as u32;
-        if i == count - 1 {
-            s.ensure_end()?;
-        }
-        Ok((item, size))
-    })
-}
-
-fn ty2str(t: Type) -> &'static str {
-    match t {
-        Type::I32 => "i32",
-        Type::I64 => "i64",
-        Type::F32 => "f32",
-        Type::F64 => "f64",
-        Type::V128 => "v128",
-        Type::AnyFunc => "anyfunc",
-        Type::AnyRef => "anyref",
-        Type::Func | Type::EmptyBlockType => "?",
     }
 }
